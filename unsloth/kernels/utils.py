@@ -13,8 +13,15 @@
 # limitations under the License.
 
 import triton
-MAX_FUSED_SIZE = 65536
 next_power_of_2 = triton.next_power_of_2
+
+def is_hip_backend():
+    target = triton.runtime.driver.active.get_current_target()
+    return target.backend == 'hip'
+
+# HIP supports upto 2**14
+MAX_FUSED_SIZE = 65536 if not is_hip_backend() else 16384
+MAX_NUM_WARP_SIZE = 32 if not is_hip_backend() else 16
 
 # torch.cuda.amp.custom_fwd is deprecated >= 2.4
 import torch

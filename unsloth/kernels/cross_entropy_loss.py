@@ -15,7 +15,7 @@
 import triton
 import triton.language as tl
 import torch
-from .utils import calculate_settings, MAX_FUSED_SIZE, triton_tanh
+from .utils import calculate_settings, MAX_FUSED_SIZE, MAX_NUM_WARP_SIZE, triton_tanh
 from transformers.models.llama.modeling_llama import logger
 
 
@@ -257,8 +257,6 @@ def _cross_entropy_backward(
 pass
 
 
-MAX_FUSED_SIZE = 65536 # 2**16
-
 class Fast_CrossEntropyLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, labels, logit_softcapping = 0, logit_scaling = 0):
@@ -305,7 +303,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                 SOFTCAP          = logit_softcapping,
                 DO_LOGIT_SCALING = DO_LOGIT_SCALING,
                 LOGIT_SCALE      = logit_scaling,
-                num_warps        = 32,
+                num_warps        = MAX_NUM_WARP_SIZE,
             )
             # logsumexp(chunked_logsumexp) - x
             # Do the -x separately
