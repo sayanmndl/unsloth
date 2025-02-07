@@ -60,8 +60,7 @@ if HAS_FLASH_ATTENTION_SOFTCAPPING:
     from flash_attn import flash_attn_func
 
 # [TODO] We must randomnly use torch.compile?
-# I checked the gradients and formulas and I'm sure it's correct.
-# I'm stumped :(
+# Gemma 2 uses double RMS Layernorms, so the backward passes should not overwrite the gradients!
 @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def fast_rms_layernorm_gemma2_compiled(layernorm, X, gemma = True):
     old_dtype = X.dtype
@@ -76,7 +75,7 @@ pass
 def Gemma2Attention_fast_forward(
     self,
     hidden_states:        torch.Tensor,
-    causal_mask:          Optional[xformers.attn_bias.BlockDiagonalCausalMask] = None,
+    causal_mask:          Optional[BlockDiagonalCausalMask] = None,
     attention_mask:       Optional[torch.Tensor] = None,
     position_ids:         Optional[torch.LongTensor] = None,
     past_key_value:       Optional[Tuple[torch.Tensor]] = None,
@@ -99,9 +98,9 @@ def Gemma2Attention_fast_forward(
 
     bsz, q_len, _ = hidden_states.size()
 
-    n_heads    = self.num_heads
+    n_heads    = self.config.num_attention_heads
     n_groups   = self.num_key_value_groups
-    n_kv_heads = self.num_key_value_heads
+    n_kv_heads = self.config.num_key_value_heads
     head_dim   = self.head_dim
     assert(n_kv_heads * n_groups == n_heads)
 
@@ -170,7 +169,7 @@ pass
 def Gemma2DecoderLayer_fast_forward(
     self,
     hidden_states:        torch.Tensor,
-    causal_mask:          Optional[xformers.attn_bias.BlockDiagonalCausalMask] = None,
+    causal_mask:          Optional[BlockDiagonalCausalMask] = None,
     attention_mask:       Optional[torch.Tensor] = None,
     position_ids:         Optional[torch.LongTensor] = None,
     past_key_value:       Optional[Tuple[torch.Tensor]] = None,
@@ -194,7 +193,7 @@ def Gemma2DecoderLayer_fast_forward(
             output_attentions=output_attentions,
             use_cache=use_cache,
             padding_mask=padding_mask,
-            _flag_for_generation=True,
+            _flag_for_generation=self._flag_for_generation,
         )
         hidden_states = fast_rms_layernorm_inference_gemma(self.post_attention_layernorm, hidden_states, out_weight)
         hidden_states += residual
@@ -207,7 +206,7 @@ def Gemma2DecoderLayer_fast_forward(
         hidden_states += residual
     else:
         residual = hidden_states
-        hidden_states = fast_rms_layernorm_gemma2_compiled(self.input_layernorm, hidden_states, gemma = True)
+        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states, gemma = True)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             causal_mask=causal_mask,
@@ -218,14 +217,14 @@ def Gemma2DecoderLayer_fast_forward(
             use_cache=use_cache,
             padding_mask=padding_mask,
         )
-        hidden_states = fast_rms_layernorm_gemma2_compiled(self.post_attention_layernorm, hidden_states, gemma = True)
+        hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states, gemma = True)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = fast_rms_layernorm_gemma2_compiled(self. pre_feedforward_layernorm, hidden_states, gemma = True)
+        hidden_states = fast_rms_layernorm(self. pre_feedforward_layernorm, hidden_states, gemma = True)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = fast_rms_layernorm_gemma2_compiled(self.post_feedforward_layernorm, hidden_states, gemma = True)
+        hidden_states = fast_rms_layernorm(self.post_feedforward_layernorm, hidden_states, gemma = True)
         hidden_states = residual + hidden_states
     pass
 
@@ -256,12 +255,14 @@ def Gemma2Attention_fast_forward_inference(
     K1, V1 = past_key_value
     dtype = Xn.dtype
 
-    n_heads    = self.num_heads
+    n_heads    = self.config.num_attention_heads
     n_groups   = self.num_key_value_groups
-    n_kv_heads = self.num_key_value_heads
+    n_kv_heads = self.config.num_key_value_heads
     head_dim   = self.head_dim
-    attention_size = n_heads*head_dim
     # assert(n_kv_heads * n_groups == n_heads)
+
+    hidden_size = self.config.hidden_size
+    attention_size = n_heads*head_dim
     seq_len = K1.shape[-2]
     kv_seq_len = seq_len + 1
 
@@ -277,7 +278,7 @@ def Gemma2Attention_fast_forward_inference(
         self.temp_KV = torch.empty((2, bsz, 1, n_kv_heads*head_dim), dtype = dtype, device = "cuda:0")
         self.RH_Q = torch.empty((bsz, n_heads, 1, head_dim), dtype = dtype, device = "cuda:0")
         # Only for Gemma2
-        self.temp_O  = torch.empty((1, bsz, self.hidden_size), dtype = dtype, device = "cuda:0")
+        self.temp_O  = torch.empty((1, bsz, hidden_size), dtype = dtype, device = "cuda:0")
         self.attention = torch.empty((bsz, n_heads, 1, KV_CACHE_INCREMENT+seq_len), dtype = dtype, device = "cuda:0")
         
         # See https://github.com/google/gemma_pytorch/commit/03e657582d17cb5a8617ebf333c1c16f3694670e
@@ -490,60 +491,9 @@ class FastGemma2Model(FastLlamaModel):
 
 
     @staticmethod
-    def post_patch(model):
-        # Patch model for Gemma
-        layers = model.model.layers
-
-        # Torch.compile fails on embedding matrix??
-        # Workaround randomnly fixes it for torch versions < 2.2
-        model.model.embed_tokens = torch.nn.Embedding.from_pretrained(model.model.embed_tokens.weight)
-        model.config.update({"unsloth_version" : __version__})
-
-        # We also do this for the lm_head
-        lm_head = torch.nn.Linear(1, 1, bias = None)
-        del lm_head.weight
-        lm_head.weight = model.lm_head.weight
-        lm_head.in_features  = lm_head.weight.shape[1]
-        lm_head.out_features = lm_head.weight.shape[0]
-        model.lm_head = lm_head
-
-        # Gemma has tied weights! This means lm_head == embed_tokens
-        if model.model.embed_tokens.weight.data_ptr() != model.lm_head.weight.data_ptr():
-            lm_head = torch.nn.Linear(1, 1, bias = None)
-            del lm_head.weight
-            lm_head.weight = model.model.embed_tokens.weight
-            lm_head.in_features  = lm_head.weight.shape[1]
-            lm_head.out_features = lm_head.weight.shape[0]
-            model.lm_head = lm_head
-        pass
-
-        # Also patch all dtypes - BnB seems to not allocate the correct type?
-        # BnB default dtype seems to be float16!
-        correct_dtype = lm_head.weight.dtype
-
-        for name, module in model.named_modules():
-            if isinstance(module, (Bnb_Linear4bit, Peft_Linear4bit)):
-                weight = module.weight
-                quant_state = weight.quant_state
-
-                if type(quant_state) is list:
-                    # BnB seems to have float16 as default!
-                    module.weight.quant_state[2] = correct_dtype # Cast to correct dtype
-                else:
-                    # https://github.com/TimDettmers/bitsandbytes/pull/763/files
-                    quant_state.dtype = correct_dtype
-                pass
-            pass
-            # Downcast RoPE embedding to correct data type
-            # RoPE must be done in float32 for Gemma
-            # if (name.endswith("rotary_emb") or hasattr(module, "cos_cached")) \
-            #     and (module.cos_cached.dtype != correct_dtype):
-
-            #     module.cos_cached = module.cos_cached.to(correct_dtype)
-            #     module.sin_cached = module.sin_cached.to(correct_dtype)
-            #     pass
-            # pass
-        pass
+    def post_patch(model, tokenizer):
+        # Gemma does not downcast RoPE
+        model, tokenizer = patch_model_and_tokenizer(model, tokenizer, downcast_rope = False)
 
         # Add 1 to weight
         # return output * (1 + self.weight)
@@ -576,6 +526,6 @@ class FastGemma2Model(FastLlamaModel):
         for _ in range(3):
             gc.collect()
             torch.cuda.empty_cache()
-        return model
+        return model, tokenizer
     pass
 pass

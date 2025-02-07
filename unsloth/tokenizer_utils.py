@@ -64,6 +64,7 @@ IGNORED_TOKENIZER_NAMES = frozenset(
 keynames = "\n" + "\n".join(os.environ.keys())
 IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
 IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+KAGGLE_TMP = "/tmp"
 del keynames
 
 
@@ -263,6 +264,10 @@ def assert_same_tokenization(slow_tokenizer, fast_tokenizer):
         if x.endswith("_token") and x.count("_") == 1
     )))
     all_special_tokens = list(set(special_tokens + slow_tokenizer.all_special_tokens))
+
+    # Remove replacement char for false positive
+    replacement_char = b"\xc3\xaf\xc2\xbf\xc2\xbd".decode("utf-8")
+    all_special_tokens = [x for x in all_special_tokens if x != replacement_char]
 
     # Check if chat template is enabled!
     check_chat_template1 = True
@@ -470,8 +475,12 @@ def _load_correct_tokenizer(
     cache_dir = "huggingface_tokenizers_cache",
     fix_tokenizer = True,
 ):
-    if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
+    if IS_COLAB_ENVIRONMENT:
         cache_dir = cache_dir
+    elif IS_KAGGLE_ENVIRONMENT:
+        # /tmp of Kaggle seems has a 80GB limit!
+        # Let's utilize them
+        cache_dir = os.path.join(KAGGLE_TMP, cache_dir)
     else:
         cache_dir = None
     pass
@@ -513,6 +522,9 @@ def _load_correct_tokenizer(
         return fast_tokenizer
     # Ignore Mistral ones - they're a bit weird to handle!
     elif "mistral" in tokenizer_name.lower():
+        return fast_tokenizer
+    # Ignore Phi-4 ones as well
+    elif "phi-4" in tokenizer_name.lower():
         return fast_tokenizer
     elif slow_tokenizer is not None:
         if hasattr(fast_tokenizer, "add_bos_token") and hasattr(slow_tokenizer, "add_bos_token"):
@@ -580,20 +592,43 @@ def load_correct_tokenizer(
 pass
 
 
+def _find_end_position(template, endfor, endif):
+    where_endfor = template.find(endfor)
+    where_endif = template.find(endif)
+    if where_endfor == where_endif == -1:
+        return None
+    elif where_endfor > where_endif:
+        return endfor
+    else:
+        return endif
+    pass
+pass
+
+
 def _fix_chat_template(chat_template):
     endfor = "{% endfor %}"
-    where = chat_template.find(endfor)
-    if where == -1: return chat_template
+    endif = "{% endif %}"
+    chosen_end = _find_end_position(chat_template, endfor, endif)
+    if chosen_end is None:
+        endfor = "{%- endfor %}"
+        endif = "{%- endif %}"
+        chosen_end = _find_end_position(chat_template, endfor, endif)
+    if chosen_end is None:
+        return chat_template
+    
+    where = chat_template.find(chosen_end)
 
-    after_endfor = chat_template[where + len(endfor):]
+    after_endfor = chat_template[where + len(chosen_end):]
 
-    if "{% if" not in after_endfor and "{% set " not in after_endfor and \
+    dash = "-" if chosen_end.startswith("{%-") else ""
+
+    if "{%" + dash + " if" not in after_endfor and "{%" + dash + " set " not in after_endfor and \
         after_endfor.startswith("{{") and after_endfor.endswith("}}") and \
         after_endfor.count("{{") == 1 and after_endfor.count("}}") == 1:
 
-        after_endfor = "{% if add_generation_prompt %}" + after_endfor + "{% endif %}"
+        after_endfor = "{%" + dash + " if add_generation_prompt %}" + after_endfor + endif
 
-        chat_template = chat_template[:where + len(endfor)] + after_endfor
+        chat_template = chat_template[:where + len(chosen_end)] + after_endfor
     pass
     return chat_template
 pass
@@ -638,10 +673,12 @@ def fix_chat_template(tokenizer):
 
     if no == yes:
         # SAME?! That's not good! We check for add_generation_prompt
-        if "{% if add_generation_prompt %}" not in chat_template:
+        if   "{% if add_generation_prompt %}" not in chat_template and \
+            "{%- if add_generation_prompt %}" not in chat_template:
             # Try fixing it by adding it
             new_chat_template = _fix_chat_template(chat_template)
-            if "{% if add_generation_prompt %}" not in new_chat_template:
+            if   "{% if add_generation_prompt %}" not in new_chat_template and \
+                "{%- if add_generation_prompt %}" not in new_chat_template:
                 raise RuntimeError(
                     f"Unsloth: The tokenizer `{tokenizer.name_or_path}`\n"\
                     "does not have a {% if add_generation_prompt %} for generation purposes.\n"\
@@ -996,13 +1033,14 @@ def patch_sft_trainer_tokenizer():
         # Also DPO weirdly tokenizes non numeric columns? Delete them!
         check_text += \
         "\n"\
-        "column_names = set(self.train_dataset.column_names)\n"\
-        "check = ['chosen', 'rejected', 'prompt', 'chosen_input_ids', 'chosen_attention_mask',\n"\
-        " 'chosen_labels', 'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels',\n"\
-        " 'prompt_input_ids', 'prompt_attention_mask']\n"\
-        "if all(x in column_names for x in check):\n"\
-        "    self.train_dataset = self.train_dataset.remove_columns(['chosen', 'rejected', 'prompt'])\n"\
-        "del check, column_names\n"\
+        "if hasattr(self.train_dataset, 'column_names'):\n"\
+        "    column_names = set(self.train_dataset.column_names)\n"\
+        "    check = ['chosen', 'rejected', 'prompt', 'chosen_input_ids', 'chosen_attention_mask',\n"\
+        "        'chosen_labels', 'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels',\n"\
+        "        'prompt_input_ids', 'prompt_attention_mask']\n"\
+        "    if all(x in column_names for x in check):\n"\
+        "        self.train_dataset = self.train_dataset.remove_columns(['chosen', 'rejected', 'prompt'])\n"\
+        "    del check, column_names\n"\
         "\n"
 
         check_text = check_text.split("\n")

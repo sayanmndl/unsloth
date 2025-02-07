@@ -15,12 +15,13 @@
 import torch
 from functools import lru_cache
 from transformers.models.llama.modeling_llama import logger
+import os
 
 torch_compile_options = {
     "epilogue_fusion"   : True,
     "max_autotune"      : True,
     "shape_padding"     : True,
-    "trace.enabled"     : False, # Output Triton kernel outputs!
+    "trace.enabled"     : os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1",
     "triton.cudagraphs" : False,
 }
 
@@ -42,9 +43,9 @@ if not HAS_FLEX_ATTENTION:
     # Logit softcapping
     @torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
     def slow_attention_softcapping(Q, K, V, causal_mask, self, bsz, q_len):
-        n_heads    = self.num_heads
+        n_heads    = self.config.num_attention_heads
         head_dim   = self.head_dim
-        n_kv_heads = self.num_key_value_heads
+        n_kv_heads = self.config.num_key_value_heads
         n_groups   = self.num_key_value_groups
         
         # Grouped query attention
@@ -129,7 +130,7 @@ else:
     pass
     
     def slow_attention_softcapping(Q, K, V, causal_mask, self, bsz, q_len):
-        n_heads    = self.num_heads
+        n_heads    = self.config.num_attention_heads
         head_dim   = self.head_dim
         s = self.config.query_pre_attn_scalar
         t = self.config.attn_logit_softcapping
@@ -146,9 +147,9 @@ torch_matmul = torch.matmul
 torch_tanh   = torch.tanh
 torch_nn_functional_softmax = torch.nn.functional.softmax
 def slow_inference_attention_softcapping(Q, K, V, causal_mask, self, bsz, q_len):
-    n_heads    = self.num_heads
+    n_heads    = self.config.num_attention_heads
     head_dim   = self.head_dim
-    n_kv_heads = self.num_key_value_heads
+    n_kv_heads = self.config.num_key_value_heads
     n_groups   = self.num_key_value_groups
     
     # Grouped query attention
