@@ -72,7 +72,7 @@ import bitsandbytes as bnb
 if not is_hip_backend():
     HAS_CUDA_STREAM = Version(bnb.__version__) > Version("0.43.3")
 else:
-    HAS_CUDA_STREAM = Version(bnb.__version__) >= Version("0.43.3") # bnb 0.43.3 implementation for ROCm seems to work
+    HAS_CUDA_STREAM = Version(bnb.__version__.rsplit('.dev')[0]) >= Version("0.43.3") # bnb 0.43.3.dev0 implementation for ROCm seems to work
 global CUDA_STREAM
 CUDA_STREAM = None
 get_ptr = bnb.functional.get_ptr
